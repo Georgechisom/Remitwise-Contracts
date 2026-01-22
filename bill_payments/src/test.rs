@@ -1,0 +1,292 @@
+#[cfg(test)]
+mod test {
+    use crate::*;
+    use soroban_sdk::Env;
+    use soroban_sdk::testutils::{Ledger, LedgerInfo};
+
+    fn set_time(env: &Env, timestamp: u64) {
+    let proto = env.ledger().protocol_version();
+
+    env.ledger().set(LedgerInfo {
+        protocol_version: proto,
+        sequence_number: 1,
+        timestamp,
+        network_id: [0; 32],
+        base_reserve: 10,
+        min_temp_entry_ttl: 1,
+        min_persistent_entry_ttl: 1,
+        max_entry_ttl: 100000,
+    });
+}
+
+    #[test]
+    fn test_create_bill() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let bill_id = client.create_bill(
+            &String::from_str(&env, "Electricity"),
+            &1000,
+            &1000000,
+            &false,
+            &0,
+        );
+
+        assert_eq!(bill_id, 1);
+
+        let bill = client.get_bill(&1);
+        assert!(bill.is_some());
+        let bill = bill.unwrap();
+        assert_eq!(bill.amount, 1000);
+        assert_eq!(bill.paid, false);
+    }
+
+    #[test]
+    fn test_create_bill_invalid_amount() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let result =
+            client.try_create_bill(&String::from_str(&env, "Invalid"), &0, &1000000, &false, &0);
+
+        assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+    }
+
+    #[test]
+    fn test_create_recurring_bill_invalid_frequency() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let result = client.try_create_bill(
+            &String::from_str(&env, "Monthly"),
+            &500,
+            &1000000,
+            &true,
+            &0,
+        );
+
+        assert_eq!(result, Err(Ok(Error::InvalidFrequency)));
+    }
+
+    #[test]
+    fn test_create_bill_negative_amount() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let result = client.try_create_bill(
+            &String::from_str(&env, "Invalid"),
+            &-100,
+            &1000000,
+            &false,
+            &0,
+        );
+
+        assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+    }
+
+    #[test]
+    fn test_pay_bill() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let bill_id =
+            client.create_bill(&String::from_str(&env, "Water"), &500, &1000000, &false, &0);
+
+        client.pay_bill(&bill_id);
+
+        let bill = client.get_bill(&bill_id).unwrap();
+        assert_eq!(bill.paid, true);
+        assert!(bill.paid_at.is_some());
+    }
+
+    #[test]
+    fn test_recurring_bill() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let bill_id = client.create_bill(
+            &String::from_str(&env, "Rent"),
+            &10000,
+            &1000000,
+            &true,
+            &30,
+        );
+
+        client.pay_bill(&bill_id);
+
+        // Check original bill is paid
+        let bill = client.get_bill(&bill_id).unwrap();
+        assert_eq!(bill.paid, true);
+
+        // Check next recurring bill was created
+        let bill2 = client.get_bill(&2).unwrap();
+        assert_eq!(bill2.paid, false);
+        assert_eq!(bill2.amount, 10000);
+        assert_eq!(bill2.due_date, 1000000 + (30 * 86400));
+    }
+
+    #[test]
+    fn test_get_unpaid_bills() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        client.create_bill(&String::from_str(&env, "Bill1"), &100, &1000000, &false, &0);
+        client.create_bill(&String::from_str(&env, "Bill2"), &200, &1000000, &false, &0);
+        client.create_bill(&String::from_str(&env, "Bill3"), &300, &1000000, &false, &0);
+
+        client.pay_bill(&1);
+
+        let unpaid = client.get_unpaid_bills();
+        assert_eq!(unpaid.len(), 2);
+    }
+
+    #[test]
+    fn test_get_total_unpaid() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        client.create_bill(&String::from_str(&env, "Bill1"), &100, &1000000, &false, &0);
+        client.create_bill(&String::from_str(&env, "Bill2"), &200, &1000000, &false, &0);
+        client.create_bill(&String::from_str(&env, "Bill3"), &300, &1000000, &false, &0);
+
+        client.pay_bill(&1);
+
+        let total = client.get_total_unpaid();
+        assert_eq!(total, 500); // 200 + 300
+    }
+
+    #[test]
+    fn test_pay_nonexistent_bill() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let result = client.try_pay_bill(&999);
+        assert_eq!(result, Err(Ok(Error::BillNotFound)));
+    }
+
+    #[test]
+    fn test_pay_already_paid_bill() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let bill_id =
+            client.create_bill(&String::from_str(&env, "Test"), &100, &1000000, &false, &0);
+
+        client.pay_bill(&bill_id);
+        let result = client.try_pay_bill(&bill_id);
+        assert_eq!(result, Err(Ok(Error::BillAlreadyPaid)));
+    }
+
+    #[test]
+    fn test_get_overdue_bills() {
+        let env = Env::default();
+        set_time(&env, 2_000_000);
+
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        // Create bills with different due dates
+        client.create_bill(
+            &String::from_str(&env, "Overdue1"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+        );
+        client.create_bill(
+            &String::from_str(&env, "Overdue2"),
+            &200,
+            &1500000,
+            &false,
+            &0,
+        );
+        client.create_bill(
+            &String::from_str(&env, "Future"),
+            &300,
+            &3000000,
+            &false,
+            &0,
+        );
+
+        let overdue = client.get_overdue_bills();
+        assert_eq!(overdue.len(), 2); // Only first two are overdue
+    }
+
+    #[test]
+    fn test_cancel_bill() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let bill_id =
+            client.create_bill(&String::from_str(&env, "Test"), &100, &1000000, &false, &0);
+
+        client.cancel_bill(&bill_id);
+        let bill = client.get_bill(&bill_id);
+        assert!(bill.is_none());
+    }
+
+    #[test]
+    fn test_cancel_nonexistent_bill() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let result = client.try_cancel_bill(&999);
+        assert_eq!(result, Err(Ok(Error::BillNotFound)));
+    }
+
+    #[test]
+    fn test_multiple_recurring_payments() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        // Create recurring bill
+        let bill_id = client.create_bill(
+            &String::from_str(&env, "Subscription"),
+            &999,
+            &1000000,
+            &true,
+            &30,
+        );
+
+        // Pay first bill - creates second
+        client.pay_bill(&bill_id);
+        let bill2 = client.get_bill(&2).unwrap();
+        assert_eq!(bill2.paid, false);
+        assert_eq!(bill2.due_date, 1000000 + (30 * 86400));
+
+        // Pay second bill - creates third
+        client.pay_bill(&2);
+        let bill3 = client.get_bill(&3).unwrap();
+        assert_eq!(bill3.paid, false);
+        assert_eq!(bill3.due_date, 1000000 + (60 * 86400));
+    }
+
+    #[test]
+    fn test_get_all_bills() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        client.create_bill(&String::from_str(&env, "Bill1"), &100, &1000000, &false, &0);
+        client.create_bill(&String::from_str(&env, "Bill2"), &200, &1000000, &false, &0);
+        client.create_bill(&String::from_str(&env, "Bill3"), &300, &1000000, &false, &0);
+
+        client.pay_bill(&1);
+
+        let all = client.get_all_bills();
+        assert_eq!(all.len(), 3);
+    }
+}

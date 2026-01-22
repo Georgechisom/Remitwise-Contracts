@@ -1,5 +1,7 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Env, Map, String, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, Env, Map, String, Vec,
+};
 
 #[derive(Clone)]
 #[contracttype]
@@ -9,8 +11,20 @@ pub struct Bill {
     pub amount: i128,
     pub due_date: u64, // Unix timestamp
     pub recurring: bool,
-    pub frequency_days: u32, // For recurring bills (e.g., 30 for monthly)
+    pub frequency_days: u32,
     pub paid: bool,
+    pub created_at: u64,
+    pub paid_at: Option<u64>,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    BillNotFound = 1,
+    BillAlreadyPaid = 2,
+    InvalidAmount = 3,
+    InvalidFrequency = 4,
 }
 
 #[contract]
@@ -22,13 +36,17 @@ impl BillPayments {
     ///
     /// # Arguments
     /// * `name` - Name of the bill (e.g., "Electricity", "School Fees")
-    /// * `amount` - Amount to pay
+    /// * `amount` - Amount to pay (must be positive)
     /// * `due_date` - Due date as Unix timestamp
     /// * `recurring` - Whether this is a recurring bill
-    /// * `frequency_days` - Frequency in days for recurring bills
+    /// * `frequency_days` - Frequency in days for recurring bills (must be > 0 if recurring)
     ///
     /// # Returns
     /// The ID of the created bill
+    ///
+    /// # Errors
+    /// * `InvalidAmount` - If amount is zero or negative
+    /// * `InvalidFrequency` - If recurring is true but frequency_days is 0
     pub fn create_bill(
         env: Env,
         name: String,
@@ -36,7 +54,16 @@ impl BillPayments {
         due_date: u64,
         recurring: bool,
         frequency_days: u32,
-    ) -> u32 {
+    ) -> Result<u32, Error> {
+        // Validate inputs
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        if recurring && frequency_days == 0 {
+            return Err(Error::InvalidFrequency);
+        }
+
         let mut bills: Map<u32, Bill> = env
             .storage()
             .instance()
@@ -50,6 +77,7 @@ impl BillPayments {
             .unwrap_or(0u32)
             + 1;
 
+        let current_time = env.ledger().timestamp();
         let bill = Bill {
             id: next_id,
             name: name.clone(),
@@ -58,6 +86,8 @@ impl BillPayments {
             recurring,
             frequency_days,
             paid: false,
+            created_at: current_time,
+            paid_at: None,
         };
 
         bills.set(next_id, bill);
@@ -68,7 +98,7 @@ impl BillPayments {
             .instance()
             .set(&symbol_short!("NEXT_ID"), &next_id);
 
-        next_id
+        Ok(next_id)
     }
 
     /// Mark a bill as paid
@@ -77,54 +107,62 @@ impl BillPayments {
     /// * `bill_id` - ID of the bill
     ///
     /// # Returns
-    /// True if payment was successful, false if bill not found or already paid
-    pub fn pay_bill(env: Env, bill_id: u32) -> bool {
+    /// Ok(()) if payment was successful
+    ///
+    /// # Errors
+    /// * `BillNotFound` - If bill with given ID doesn't exist
+    /// * `BillAlreadyPaid` - If bill is already marked as paid
+    pub fn pay_bill(env: Env, bill_id: u32) -> Result<(), Error> {
         let mut bills: Map<u32, Bill> = env
             .storage()
             .instance()
             .get(&symbol_short!("BILLS"))
             .unwrap_or_else(|| Map::new(&env));
 
-        if let Some(mut bill) = bills.get(bill_id) {
-            if bill.paid {
-                return false; // Already paid
-            }
+        let mut bill = bills.get(bill_id).ok_or(Error::BillNotFound)?;
 
-            bill.paid = true;
+        if bill.paid {
+            return Err(Error::BillAlreadyPaid);
+        }
 
-            // If recurring, create next bill
-            if bill.recurring {
-                let next_due_date = bill.due_date + (bill.frequency_days as u64 * 86400);
-                let next_bill = Bill {
-                    id: env
-                        .storage()
-                        .instance()
-                        .get(&symbol_short!("NEXT_ID"))
-                        .unwrap_or(0u32)
-                        + 1,
-                    name: bill.name.clone(),
-                    amount: bill.amount,
-                    due_date: next_due_date,
-                    recurring: true,
-                    frequency_days: bill.frequency_days,
-                    paid: false,
-                };
+        let current_time = env.ledger().timestamp();
+        bill.paid = true;
+        bill.paid_at = Some(current_time);
 
-                let next_id = next_bill.id;
-                bills.set(next_id, next_bill);
-                env.storage()
-                    .instance()
-                    .set(&symbol_short!("NEXT_ID"), &next_id);
-            }
+        // If recurring, create next bill
+        if bill.recurring {
+            let next_due_date = bill.due_date + (bill.frequency_days as u64 * 86400);
+            let next_id = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("NEXT_ID"))
+                .unwrap_or(0u32)
+                + 1;
 
-            bills.set(bill_id, bill);
+            let next_bill = Bill {
+                id: next_id,
+                name: bill.name.clone(),
+                amount: bill.amount,
+                due_date: next_due_date,
+                recurring: true,
+                frequency_days: bill.frequency_days,
+                paid: false,
+                created_at: current_time,
+                paid_at: None,
+            };
+
+            bills.set(next_id, next_bill);
             env.storage()
                 .instance()
-                .set(&symbol_short!("BILLS"), &bills);
-            true
-        } else {
-            false
+                .set(&symbol_short!("NEXT_ID"), &next_id);
         }
+
+        bills.set(bill_id, bill);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("BILLS"), &bills);
+
+        Ok(())
     }
 
     /// Get a bill by ID
@@ -172,6 +210,35 @@ impl BillPayments {
         result
     }
 
+    /// Get all overdue unpaid bills
+    ///
+    /// # Returns
+    /// Vec of unpaid bills that are past their due date
+    pub fn get_overdue_bills(env: Env) -> Vec<Bill> {
+        let current_time = env.ledger().timestamp();
+        let bills: Map<u32, Bill> = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("BILLS"))
+            .unwrap_or_else(|| Map::new(&env));
+
+        let mut result = Vec::new(&env);
+        let max_id = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("NEXT_ID"))
+            .unwrap_or(0u32);
+
+        for i in 1..=max_id {
+            if let Some(bill) = bills.get(i) {
+                if !bill.paid && bill.due_date < current_time {
+                    result.push_back(bill);
+                }
+            }
+        }
+        result
+    }
+
     /// Get total amount of unpaid bills
     ///
     /// # Returns
@@ -184,4 +251,61 @@ impl BillPayments {
         }
         total
     }
+
+    /// Cancel/delete a bill
+    ///
+    /// # Arguments
+    /// * `bill_id` - ID of the bill to cancel
+    ///
+    /// # Returns
+    /// Ok(()) if cancellation was successful
+    ///
+    /// # Errors
+    /// * `BillNotFound` - If bill with given ID doesn't exist
+    pub fn cancel_bill(env: Env, bill_id: u32) -> Result<(), Error> {
+        let mut bills: Map<u32, Bill> = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("BILLS"))
+            .unwrap_or_else(|| Map::new(&env));
+
+        if bills.get(bill_id).is_none() {
+            return Err(Error::BillNotFound);
+        }
+
+        bills.remove(bill_id);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("BILLS"), &bills);
+
+        Ok(())
+    }
+
+    /// Get all bills (paid and unpaid)
+    ///
+    /// # Returns
+    /// Vec of all Bill structs
+    pub fn get_all_bills(env: Env) -> Vec<Bill> {
+        let bills: Map<u32, Bill> = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("BILLS"))
+            .unwrap_or_else(|| Map::new(&env));
+
+        let mut result = Vec::new(&env);
+        let max_id = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("NEXT_ID"))
+            .unwrap_or(0u32);
+
+        for i in 1..=max_id {
+            if let Some(bill) = bills.get(i) {
+                result.push_back(bill);
+            }
+        }
+        result
+    }
 }
+
+mod test;
