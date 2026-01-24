@@ -343,7 +343,6 @@ mod testsuit {
         let env = Env::default();
         let contract_id = env.register_contract(None, BillPayments);
         let client = BillPaymentsClient::new(&env, &contract_id);
-        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
         env.mock_all_auths();
         let result = client.try_cancel_bill(&999);
         assert_eq!(result, Err(Ok(Error::BillNotFound)));
